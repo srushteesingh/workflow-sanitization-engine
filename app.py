@@ -14,11 +14,10 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 app = FastAPI(
     title="Universal CSV Cleaner & Sanitization Engine",
     description="Cleans, formats, deduplicates, and validates any CSV spreadsheet.",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 # Configurable CORS: defaults to "*" for setup; set ALLOWED_ORIGINS on Render once Vercel is live
-# Example: ALLOWED_ORIGINS=https://your-app.vercel.app,http://localhost:3000
 raw_origins = os.getenv("ALLOWED_ORIGINS", "*").strip()
 allowed_origins = (
     ["*"]
@@ -48,13 +47,14 @@ SIMPLE_PHONE_REGEX = re.compile(r"^\+\d[\d\s]{5,18}\d$")
 
 EMAIL_HEADER_HINTS = ("email", "e-mail", "mail")
 NAME_HEADER_HINTS = ("name", "first_name", "last_name", "firstname", "lastname", "contact")
+NON_NUMERIC_HEADER_HINTS = ("phone", "tel", "mobile", "zip", "postal", "id", "code", "date", "time")
 
 # Bounded in-memory stores to prevent unbounded RAM growth
 quarantine_store: deque[dict[str, Any]] = deque(maxlen=1000)
 ip_request_log: dict[str, deque[float]] = {}
 
 
-# --- Legacy Webhook Models (keeps your /v1/ingest-leads API live) ---
+# --- Legacy Webhook Models ---
 class LeadRecord(BaseModel):
     name: str
     email: str
@@ -165,6 +165,39 @@ def clean_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def detect_numeric_columns(
+    headers: list[str],
+    raw_rows: list[list[str]],
+    email_cols: set[str],
+    name_cols: set[str],
+) -> list[str]:
+    numeric_cols: list[str] = []
+    for idx, col in enumerate(headers):
+        low = col.lower()
+        if col in email_cols or col in name_cols:
+            continue
+        if any(hint in low for hint in NON_NUMERIC_HEADER_HINTS):
+            continue
+
+        non_empty = 0
+        numeric_hits = 0
+        for row in raw_rows:
+            if idx >= len(row):
+                continue
+            val = clean_whitespace(row[idx])
+            if not val:
+                continue
+            non_empty += 1
+            if NUMERIC_REGEX.match(val):
+                numeric_hits += 1
+
+        # Treat as a numeric column if at least 3 values exist and >= 60% are valid numbers
+        if non_empty >= 3 and (numeric_hits / non_empty) >= 0.6:
+            numeric_cols.append(col)
+
+    return numeric_cols
+
+
 def neutralize_formula_injection(value: str) -> tuple[str, bool]:
     if not value:
         return value, False
@@ -188,6 +221,8 @@ def run_universal_csv_cleaning(
     dedupe_by: str = "auto",
     fix_name_casing: bool = True,
     flag_invalid_emails: bool = True,
+    flag_invalid_numbers: bool = True,
+    flag_missing_values: bool = False,
 ) -> dict[str, Any]:
     clean_headers: list[str] = []
     header_counts: Counter[str] = Counter()
@@ -199,6 +234,9 @@ def run_universal_csv_cleaning(
 
     email_cols = [h for h in clean_headers if is_email_column(h)]
     name_cols = [h for h in clean_headers if is_name_column(h)]
+    numeric_cols = detect_numeric_columns(
+        clean_headers, raw_rows, set(email_cols), set(name_cols)
+    )
 
     if dedupe_by == "auto":
         active_dedupe_mode = email_cols[0] if email_cols else "exact_row"
@@ -238,11 +276,17 @@ def run_universal_csv_cleaning(
 
             val = clean_whitespace(original_val)
 
-            if col in email_cols and val:
+            if not val:
+                if flag_missing_values:
+                    row_issues.append(f'"{col}" is blank')
+            elif col in email_cols:
                 val = val.lower()
                 if flag_invalid_emails and not EMAIL_REGEX.match(val):
                     row_issues.append(f'"{col}" does not look like a valid email address')
-            elif fix_name_casing and col in name_cols and val:
+            elif col in numeric_cols:
+                if flag_invalid_numbers and not NUMERIC_REGEX.match(val):
+                    row_issues.append(f'"{col}" should be a number (found "{val}")')
+            elif fix_name_casing and col in name_cols:
                 if val.islower() or val.isupper():
                     val = val.title()
 
@@ -288,6 +332,7 @@ def run_universal_csv_cleaning(
         "columns": clean_headers,
         "detected_email_columns": email_cols,
         "detected_name_columns": name_cols,
+        "detected_numeric_columns": numeric_cols,
         "dedupe_mode_used": active_dedupe_mode,
         "total_rows_scanned": len(raw_rows),
         "clean_count": len(clean_records),
@@ -306,7 +351,7 @@ def run_universal_csv_cleaning(
 async def health_check() -> dict[str, str]:
     return {
         "status": "ok",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "max_rows_per_upload": str(MAX_ROWS_PER_UPLOAD),
         "max_file_size_mb": "2",
     }
@@ -319,6 +364,8 @@ async def clean_csv(
     dedupe_by: str = Form(default="auto"),
     fix_name_casing: bool = Form(default=True),
     flag_invalid_emails: bool = Form(default=True),
+    flag_invalid_numbers: bool = Form(default=True),
+    flag_missing_values: bool = Form(default=False),
 ) -> dict[str, Any]:
     enforce_rate_limit(request)
 
@@ -370,6 +417,8 @@ async def clean_csv(
         dedupe_by=dedupe_by,
         fix_name_casing=fix_name_casing,
         flag_invalid_emails=flag_invalid_emails,
+        flag_invalid_numbers=flag_invalid_numbers,
+        flag_missing_values=flag_missing_values,
     )
 
 
