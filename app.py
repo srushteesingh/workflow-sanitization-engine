@@ -293,6 +293,9 @@ def run_universal_csv_cleaning(
             val, was_formula = neutralize_formula_injection(val)
             if was_formula:
                 formulas_neutralized += 1
+                row_issues.append(
+                    f'"{col}" contains a suspicious spreadsheet formula and was neutralized for safety'
+                )
 
             if val != original_val:
                 cells_fixed += 1
